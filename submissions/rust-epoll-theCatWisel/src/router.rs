@@ -82,7 +82,8 @@ impl<T> WorkQueue<T> {
             q = self.ready.wait(q).unwrap();
         }
         let first_at = Instant::now();
-        while q.len() < lanes {
+        let wait_lanes = lanes.min(4);
+        while q.len() < wait_lanes {
             let busy = busy_workers.load(Ordering::Acquire);
             let tau_us = ewma_us.load(Ordering::Relaxed);
             let min_wait_us = (tau_us >> 6).max(500);
@@ -107,7 +108,6 @@ impl<T> WorkQueue<T> {
 
     pub fn drain_bbr_codel(
         &self,
-        idle_workers: usize,
         min_items: usize,
         window: Duration,
         max_cap: usize,
@@ -127,9 +127,7 @@ impl<T> WorkQueue<T> {
                 q = self.ready.wait_timeout(q, deadline - now).unwrap().0;
             }
         }
-        let q_len = q.len();
-        let fair_share = (q_len + idle_workers - 1) / idle_workers.max(1);
-        let take_n = fair_share.max(min_items).min(q_len).min(max_cap);
+        let take_n = q.len().min(max_cap);
         dst.extend(q.drain(..take_n));
         if !q.is_empty() {
             self.ready.notify_one();

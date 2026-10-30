@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::auth::{self, BcryptInput, TokenSigner};
 use crate::codec;
 use crate::queries;
-use crate::reactor::{self, OutgoingReply, ReplyAddr};
+use crate::reactor::{self, OutgoingReply, ReplyAddr, ReplyBody};
 use crate::router::WorkQueue;
 use crate::wire::{
     self, ArrayEncoder, BindParam, Cell, DbEndpoint, PgConn, PgError, PgResult, PipelineBuf, OID_INT8, OID_TEXT,
@@ -319,7 +319,7 @@ struct ArticleRef {
     aid: i64,
     author: i64,
     art_ord: u32,
-    body_cell: Cell,
+    row: wire::RowSpan,
 }
 
 type ArticlePage = Vec<ArticleRef>;
@@ -410,6 +410,7 @@ pub struct ReadWorker {
     fav_hits: Vec<(i64, i64)>,
     foll_hits: Vec<(i64, i64)>,
     cached_arts: Vec<CachedArticleSlices>,
+    feed_depths: Vec<i64>,
     enc_a: ArrayEncoder,
     enc_b: ArrayEncoder,
     enc_c: ArrayEncoder,
@@ -455,7 +456,8 @@ impl ReadWorker {
             fav_hits: Vec::with_capacity(128),
             foll_hits: Vec::with_capacity(128),
             cached_arts: Vec::with_capacity(256),
-            enc_a: ArrayEncoder::with_capacity(OID_TEXT, 256),
+            feed_depths: Vec::with_capacity(128),
+            enc_a: ArrayEncoder::with_capacity(OID_INT8, 256),
             enc_b: ArrayEncoder::with_capacity(OID_INT8, 256),
             enc_c: ArrayEncoder::with_capacity(OID_INT8, 256),
         }
@@ -477,24 +479,29 @@ impl ReadWorker {
         let mut err_addrs = Vec::new();
         let rw = self.cfg.read_workers.max(2);
         let num_families = queries::read_catalog().len();
+        let min_batch = num_families * rw;
+        let max_batch = min_batch * 2;
         loop {
             tasks.clear();
             {
                 let _guard = BATCH_LOCK.lock().unwrap();
-                let busy = BUSY_READ_WORKERS.load(Ordering::Relaxed).min(rw - 1);
-                let idle = rw - busy;
+                let busy = BUSY_READ_WORKERS.load(Ordering::Relaxed).min(rw);
                 let tau_us = EWMA_BATCH_US.load(Ordering::Relaxed);
-                let bar_n = EWMA_BATCH_LEN.load(Ordering::Relaxed).max(num_families * rw);
-                let pace_us = (tau_us * (idle - 1)) / rw;
-                let dyn_min = bar_n.max(num_families * idle);
-                let dyn_cap = (bar_n * 2).max(num_families * rw * 4);
+                let pace_us = if busy == 0 {
+                    (tau_us >> 4).clamp(50, 250)
+                } else {
+                    ((tau_us * busy) / (rw * rw)).clamp(100, 1500)
+                };
                 READ_QUEUE.drain_bbr_codel(
-                    idle,
-                    dyn_min,
+                    min_batch,
                     Duration::from_micros(pace_us as u64),
-                    dyn_cap,
+                    max_batch,
                     &mut tasks,
                 );
+            }
+            tasks.retain(|t| reactor::is_addr_alive(t.addr));
+            if tasks.is_empty() {
+                continue;
             }
             let batch_n = tasks.len();
             BUSY_READ_WORKERS.fetch_add(1, Ordering::Relaxed);
@@ -508,7 +515,8 @@ impl ReadWorker {
                 elapsed_us
             } else {
                 (prev_us * 3 + elapsed_us) / 4
-            };
+            }
+            .clamp(200, 100_000);
             EWMA_BATCH_US.store(next_us, Ordering::Relaxed);
 
             let prev_n = EWMA_BATCH_LEN.load(Ordering::Relaxed);
@@ -645,29 +653,45 @@ impl ReadWorker {
         if st_cmts.is_some() {
             tx.bind_and_exec("cmts", &[BindParam::TextSlice(&self.k_cmts.items)]);
         }
-        if st_global.is_some() {
-            self.enc_b.reset(OID_INT8, self.k_global.items.len());
-            self.enc_c.reset(OID_INT8, self.k_global.items.len());
-            for &(l, o) in &self.k_global.items {
-                self.enc_b.push_i64(l);
-                self.enc_c.push_i64(o);
+        let mut global_win_max: i64 = 0;
+        let mut use_global_win = self.k_global.len() > 0;
+        for &(l, o) in &self.k_global.items {
+            let end = l.saturating_add(o);
+            if end > 200 {
+                use_global_win = false;
+                break;
             }
-            tx.bind_and_exec(
-                "global",
-                &[
-                    BindParam::Raw(self.enc_b.finish()),
-                    BindParam::Raw(self.enc_c.finish()),
-                ],
-            );
+            if end > global_win_max {
+                global_win_max = end;
+            }
+        }
+        if st_global.is_some() {
+            if use_global_win {
+                tx.bind_and_exec("global_win", &[BindParam::I64(global_win_max.max(1))]);
+            } else {
+                self.enc_b.reset(OID_INT8, self.k_global.items.len());
+                self.enc_c.reset(OID_INT8, self.k_global.items.len());
+                for &(l, o) in &self.k_global.items {
+                    self.enc_b.push_i64(l);
+                    self.enc_c.push_i64(o);
+                }
+                tx.bind_and_exec(
+                    "global",
+                    &[
+                        BindParam::Raw(self.enc_b.finish()),
+                        BindParam::Raw(self.enc_c.finish()),
+                    ],
+                );
+            }
         }
         for i in 0..3 {
             if st_filters[i].is_some() {
                 let fd = &self.k_filters[i];
-                self.enc_a.reset(OID_TEXT, fd.pages.items.len());
+                self.enc_a.reset(OID_INT8, fd.pages.items.len());
                 self.enc_b.reset(OID_INT8, fd.pages.items.len());
                 self.enc_c.reset(OID_INT8, fd.pages.items.len());
                 for &(c_ord, l, o) in &fd.pages.items {
-                    self.enc_a.push_bytes(fd.counts.items[c_ord as usize].as_bytes());
+                    self.enc_a.push_i64(c_ord as i64 + 1);
                     self.enc_b.push_i64(l);
                     self.enc_c.push_i64(o);
                 }
@@ -683,11 +707,17 @@ impl ReadWorker {
             }
         }
         if st_feed.is_some() {
+            self.feed_depths.clear();
+            self.feed_depths.resize(self.k_feed_cnt.items.len(), 1);
             self.enc_a.reset(OID_INT8, self.k_feed_page.items.len());
             self.enc_b.reset(OID_INT8, self.k_feed_page.items.len());
             self.enc_c.reset(OID_INT8, self.k_feed_page.items.len());
             for &(c_ord, l, o) in &self.k_feed_page.items {
-                self.enc_a.push_i64(self.k_feed_cnt.items[c_ord as usize]);
+                let d = l.saturating_add(o).max(1);
+                if d > self.feed_depths[c_ord as usize] {
+                    self.feed_depths[c_ord as usize] = d;
+                }
+                self.enc_a.push_i64(c_ord as i64 + 1);
                 self.enc_b.push_i64(l);
                 self.enc_c.push_i64(o);
             }
@@ -695,6 +725,7 @@ impl ReadWorker {
                 "feed",
                 &[
                     BindParam::I64Slice(&self.k_feed_cnt.items),
+                    BindParam::I64Slice(&self.feed_depths),
                     BindParam::Raw(self.enc_a.finish()),
                     BindParam::Raw(self.enc_b.finish()),
                     BindParam::Raw(self.enc_c.finish()),
@@ -778,9 +809,10 @@ impl ReadWorker {
             }
         }
 
-        let mut intern_art = |aid: i64, author: i64, span: wire::RowSpan, body_cell: Cell| -> ArticleRef {
+        let mut intern_art = |aid: i64, author: i64, span: wire::RowSpan| -> ArticleRef {
+            let prev_len = self.distinct_arts.len();
             let ord = self.distinct_arts.intern(aid);
-            if (ord as usize) >= self.art_author_ords.len() {
+            if (ord as usize) == prev_len {
                 let au_ord = self.distinct_authors.intern(author);
                 self.art_author_ords.push(au_ord);
                 self.art_spans.push(span);
@@ -789,7 +821,7 @@ impl ReadWorker {
                 aid,
                 author,
                 art_ord: ord,
-                body_cell,
+                row: span,
             }
         };
 
@@ -800,7 +832,7 @@ impl ReadWorker {
                     let r = pa.row(span);
                     let ord = pa.i64(r[0]);
                     if ord >= 1 && (ord as usize) <= len {
-                        out[ord as usize - 1] = Some(intern_art(pa.i64(r[1]), pa.i64(r[2]), span, r[8]));
+                        out[ord as usize - 1] = Some(intern_art(pa.i64(r[1]), pa.i64(r[2]), span));
                     }
                 }
             }
@@ -834,14 +866,30 @@ impl ReadWorker {
                     let dst = &mut pages[p_idx];
                     dst.reserve(rp.len());
                     for (aid, author, span) in rp {
-                        dst.push(intern_art(aid, author, span, Cell { offset: 0, len: -1 }));
+                        dst.push(intern_art(aid, author, span));
                     }
                 }
             }
             (counts, pages)
         };
 
-        let (global_counts, global_pages) = unpack_list(st_global, 1, self.k_global.len());
+        let (global_counts, global_pages) = if use_global_win {
+            let (cnts, mut win_pages) = unpack_list(st_global, 1, 1);
+            let win = win_pages.pop().unwrap_or_default();
+            let pages: Vec<ArticlePage> = self
+                .k_global
+                .items
+                .iter()
+                .map(|&(lim, off)| {
+                    let start = (off.max(0) as usize).min(win.len());
+                    let end = start.saturating_add(lim.max(0) as usize).min(win.len());
+                    win[start..end].to_vec()
+                })
+                .collect();
+            (cnts, pages)
+        } else {
+            unpack_list(st_global, 1, self.k_global.len())
+        };
         let filter_results: Vec<(Vec<i64>, Vec<ArticlePage>)> = (0..3)
             .map(|i| {
                 unpack_list(
@@ -903,9 +951,11 @@ impl ReadWorker {
                     }
                 }
                 PlanSlot::Profile(k) => {
-                    if let (Some(s), Some(&row_i)) = (st_prof, grp_prof[k as usize].first()) {
-                        let r = pa.row(pa.result_rows(s)[row_i]);
-                        self.foll_pairs.push((viewer, pa.i64(r[1])));
+                    if let Some(s) = st_prof {
+                        if let Some(&row_i) = grp_prof[k as usize].first() {
+                            let r = pa.row(pa.result_rows(s)[row_i]);
+                            self.foll_pairs.push((viewer, pa.i64(r[1])));
+                        }
                     }
                 }
                 PlanSlot::Tags | PlanSlot::User(_) | PlanSlot::Login(_) => {}
@@ -991,6 +1041,8 @@ impl ReadWorker {
             }
         }
 
+        self.author_spans.clear();
+        self.author_spans.resize(self.distinct_authors.len(), None);
         self.cached_arts.clear();
         self.cached_arts
             .resize(self.distinct_arts.len(), CachedArticleSlices::default());
@@ -1001,14 +1053,11 @@ impl ReadWorker {
         let mut tag_sort_buf: Vec<&[u8]> = Vec::with_capacity(8);
 
         if n_phase_b > 0 {
-            self.author_spans.clear();
-            self.author_spans.resize(self.distinct_authors.len(), None);
             if let Some(s) = b_artau {
-                let n_au = self.distinct_authors.len();
                 for &span in pb.result_rows(s) {
                     let r = pb.row(span);
                     let ord = pb.i64(r[0]);
-                    if ord >= 1 && (ord as usize) <= n_au {
+                    if ord >= 1 && (ord as usize) <= self.author_spans.len() {
                         self.author_spans[ord as usize - 1] = Some(span);
                     }
                 }
@@ -1026,6 +1075,7 @@ impl ReadWorker {
                         };
                         let au = pb.row(au_span);
                         let ar = pa.row(self.art_spans[k]);
+
                         let head_start = arena.len() as u32;
                         arena.extend_from_slice(b"{\"slug\":");
                         codec::write_str(arena, pa.bytes(ar[3]).unwrap_or(b""));
@@ -1151,7 +1201,16 @@ impl ReadWorker {
             foll_hits: &self.foll_hits,
         };
 
-        let mut rendered_tags: Option<Vec<u8>> = None;
+        let mut rendered_tags: Option<Arc<[u8]>> = None;
+        let mut rendered_profiles: Vec<Option<Arc<[u8]>>> = vec![None; self.k_prof.len()];
+        let mut rendered_slugs: Vec<Option<Arc<[u8]>>> = vec![None; self.k_slug.len()];
+        let mut rendered_cmts: Vec<Option<Arc<[u8]>>> = vec![None; self.k_cmts.len()];
+        let mut rendered_global: Vec<Option<Arc<[u8]>>> = vec![None; global_pages.len()];
+        let mut rendered_filters: [Vec<Option<Arc<[u8]>>>; 3] = [
+            vec![None; filter_results[0].1.len()],
+            vec![None; filter_results[1].1.len()],
+            vec![None; filter_results[2].1.len()],
+        ];
         let mut replies: Vec<OutgoingReply> = Vec::with_capacity(tasks.len());
 
         for (task, &slot) in tasks.drain(..).zip(self.plan.iter()) {
@@ -1159,7 +1218,7 @@ impl ReadWorker {
             let addr = task.addr;
             match slot {
                 PlanSlot::Tags => {
-                    let body = if let Some(cached) = &rendered_tags {
+                    let shared = if let Some(cached) = &rendered_tags {
                         cached.clone()
                     } else {
                         let s = st_tags.unwrap();
@@ -1172,13 +1231,14 @@ impl ReadWorker {
                             codec::write_str(&mut buf, pa.bytes(pa.row(span)[1]).unwrap_or(b""));
                         }
                         buf.extend_from_slice(b"]}");
-                        rendered_tags = Some(buf.clone());
-                        buf
+                        let arc: Arc<[u8]> = buf.into();
+                        rendered_tags = Some(arc.clone());
+                        arc
                     };
                     replies.push(OutgoingReply {
                         addr,
                         status: 200,
-                        body,
+                        body: ReplyBody::Shared(shared),
                     });
                 }
                 PlanSlot::User(k) => {
@@ -1200,7 +1260,7 @@ impl ReadWorker {
                             replies.push(OutgoingReply {
                                 addr,
                                 status: 200,
-                                body,
+                                body: ReplyBody::Owned(body),
                             });
                         }
                         None => replies.push(reactor::error_reply(addr, 401, "unauthorized")),
@@ -1211,6 +1271,16 @@ impl ReadWorker {
                     Some(&row_i) => {
                         let r = pa.row(pa.result_rows(st_prof.unwrap())[row_i]);
                         let following = viewer != 0 && render_ctx.is_following(viewer, pa.i64(r[1]));
+                        if !following {
+                            if let Some(shared) = &rendered_profiles[k as usize] {
+                                replies.push(OutgoingReply {
+                                    addr,
+                                    status: 200,
+                                    body: ReplyBody::Shared(shared.clone()),
+                                });
+                                continue;
+                            }
+                        }
                         let mut body = Vec::with_capacity(256);
                         body.extend_from_slice(b"{\"profile\":");
                         write_profile_json(
@@ -1221,30 +1291,63 @@ impl ReadWorker {
                             following,
                         );
                         body.push(b'}');
+                        let reply_body = if !following {
+                            let arc: Arc<[u8]> = body.into();
+                            rendered_profiles[k as usize] = Some(arc.clone());
+                            ReplyBody::Shared(arc)
+                        } else {
+                            ReplyBody::Owned(body)
+                        };
                         replies.push(OutgoingReply {
                             addr,
                             status: 200,
-                            body,
+                            body: reply_body,
                         });
                     }
                     None => replies.push(reactor::error_reply(addr, 404, "profile not found")),
                 },
                 PlanSlot::BySlug(k) | PlanSlot::ById(k) => {
-                    let (item, status) = match slot {
-                        PlanSlot::BySlug(_) => (slug_rows[k as usize], 200),
+                    let (item, status, is_slug) = match slot {
+                        PlanSlot::BySlug(_) => (slug_rows[k as usize], 200, true),
                         PlanSlot::ById(_) => {
                             let ReadOp::ArticleById { status, .. } = task.op else {
                                 unreachable!()
                             };
-                            (id_rows[k as usize], status)
+                            (id_rows[k as usize], status, false)
                         }
                         _ => unreachable!(),
                     };
+                    let Some(art) = item else {
+                        replies.push(reactor::error_reply(addr, 404, "article not found"));
+                        continue;
+                    };
+                    let unflagged = is_slug && render_ctx.is_article_unflagged(art, viewer);
+                    if unflagged {
+                        if let Some(shared) = &rendered_slugs[k as usize] {
+                            replies.push(OutgoingReply {
+                                addr,
+                                status,
+                                body: ReplyBody::Shared(shared.clone()),
+                            });
+                            continue;
+                        }
+                    }
                     let mut body = Vec::with_capacity(2048);
                     body.extend_from_slice(b"{\"article\":");
-                    if item.is_some_and(|a| render_ctx.write_article(&mut body, pa, a, true, viewer, false)) {
+                    if render_ctx.write_article(&mut body, pa, art, true, viewer, false) {
                         body.push(b'}');
-                        replies.push(OutgoingReply { addr, status, body });
+                        let reply_body = if unflagged {
+                            let arc: Arc<[u8]> = body.into();
+                            rendered_slugs[k as usize] = Some(arc.clone());
+                            ReplyBody::Shared(arc)
+                        } else {
+                            ReplyBody::Owned(body)
+                        };
+                        replies.push(OutgoingReply {
+                            addr,
+                            status,
+                            body: reply_body,
+                        });
                     } else {
                         replies.push(reactor::error_reply(addr, 404, "article not found"));
                     }
@@ -1254,6 +1357,17 @@ impl ReadWorker {
                         replies.push(reactor::error_reply(addr, 404, "article not found"));
                         continue;
                     };
+                    let unflagged = viewer == 0 || list.iter().all(|c| !render_ctx.is_following(viewer, c.author_id));
+                    if unflagged {
+                        if let Some(shared) = &rendered_cmts[k as usize] {
+                            replies.push(OutgoingReply {
+                                addr,
+                                status: 200,
+                                body: ReplyBody::Shared(shared.clone()),
+                            });
+                            continue;
+                        }
+                    }
                     let mut body = Vec::with_capacity(64 + 320 * list.len());
                     body.extend_from_slice(b"{\"comments\":[");
                     for (idx, c) in list.iter().enumerate() {
@@ -1261,14 +1375,21 @@ impl ReadWorker {
                             body.push(b',');
                         }
                         body.extend_from_slice(&render_ctx.arena[c.start as usize..c.end as usize]);
-                        let foll = viewer != 0 && render_ctx.is_following(viewer, c.author_id);
+                        let foll = !unflagged && render_ctx.is_following(viewer, c.author_id);
                         body.extend_from_slice(if foll { b"true}}" } else { b"false}}" });
                     }
                     body.extend_from_slice(b"]}");
+                    let reply_body = if unflagged {
+                        let arc: Arc<[u8]> = body.into();
+                        rendered_cmts[k as usize] = Some(arc.clone());
+                        ReplyBody::Shared(arc)
+                    } else {
+                        ReplyBody::Owned(body)
+                    };
                     replies.push(OutgoingReply {
                         addr,
                         status: 200,
-                        body,
+                        body: reply_body,
                     });
                 }
                 PlanSlot::Global(_) | PlanSlot::Filtered(..) | PlanSlot::Feed(..) => {
@@ -1282,6 +1403,23 @@ impl ReadWorker {
                         PlanSlot::Feed(c, p) => (&feed_pages[p as usize], feed_counts[c as usize], true),
                         _ => unreachable!(),
                     };
+                    let unflagged = !is_feed
+                        && (viewer == 0 || rows.iter().all(|&art| render_ctx.is_article_unflagged(art, viewer)));
+                    if unflagged {
+                        let cached = match slot {
+                            PlanSlot::Global(p) => &rendered_global[p as usize],
+                            PlanSlot::Filtered(kind, _, p) => &rendered_filters[kind][p as usize],
+                            _ => &None,
+                        };
+                        if let Some(shared) = cached {
+                            replies.push(OutgoingReply {
+                                addr,
+                                status: 200,
+                                body: ReplyBody::Shared(shared.clone()),
+                            });
+                            continue;
+                        }
+                    }
                     let mut body = Vec::with_capacity(512 + 700 * rows.len());
                     body.extend_from_slice(b"{\"articles\":[");
                     let mut first = true;
@@ -1290,7 +1428,7 @@ impl ReadWorker {
                         if !first {
                             body.push(b',');
                         }
-                        if render_ctx.write_article(&mut body, pa, art, false, viewer, is_feed) {
+                        if render_ctx.write_article(&mut body, pa, art, false, if unflagged { 0 } else { viewer }, is_feed) {
                             first = false;
                         } else {
                             body.truncate(mark);
@@ -1299,10 +1437,21 @@ impl ReadWorker {
                     body.extend_from_slice(b"],\"articlesCount\":");
                     codec::write_i64(&mut body, total_count);
                     body.push(b'}');
+                    let reply_body = if unflagged {
+                        let arc: Arc<[u8]> = body.into();
+                        match slot {
+                            PlanSlot::Global(p) => rendered_global[p as usize] = Some(arc.clone()),
+                            PlanSlot::Filtered(kind, _, p) => rendered_filters[kind][p as usize] = Some(arc.clone()),
+                            _ => {}
+                        }
+                        ReplyBody::Shared(arc)
+                    } else {
+                        ReplyBody::Owned(body)
+                    };
                     replies.push(OutgoingReply {
                         addr,
                         status: 200,
-                        body,
+                        body: reply_body,
                     });
                 }
             }
@@ -1332,6 +1481,11 @@ impl RenderCtx<'_> {
     }
 
     #[inline]
+    fn is_article_unflagged(&self, art: ArticleRef, viewer: i64) -> bool {
+        viewer == 0 || (!self.is_favorited(viewer, art.aid) && !self.is_following(viewer, art.author))
+    }
+
+    #[inline]
     fn write_article(
         &self,
         dst: &mut Vec<u8>,
@@ -1355,9 +1509,10 @@ impl RenderCtx<'_> {
             dst.extend_from_slice(&self.arena[slices.mid_end as usize..slices.tail_end as usize]);
             dst.extend_from_slice(if foll { b"true}}" } else { b"false}}" });
         } else {
+            let ar = pa.row(art.row);
             dst.extend_from_slice(&self.arena[slices.head_start as usize..slices.head_end as usize]);
             dst.extend_from_slice(b",\"body\":");
-            codec::write_str(dst, pa.bytes(art.body_cell).unwrap_or(b""));
+            codec::write_str(dst, pa.bytes(ar[8]).unwrap_or(b""));
             dst.extend_from_slice(&self.arena[slices.head_end as usize..slices.mid_end as usize]);
             dst.extend_from_slice(if fav { b"true" } else { b"false" });
             dst.extend_from_slice(&self.arena[slices.mid_end as usize..slices.tail_end as usize]);
@@ -1546,11 +1701,10 @@ impl WriteWorker {
         let mut tasks = Vec::new();
         let num_families = queries::read_catalog().len();
         let rw = self.cfg.read_workers.max(2);
+        let max_cap = num_families * rw * 2;
         loop {
             tasks.clear();
-            let bar_n = EWMA_BATCH_LEN.load(Ordering::Relaxed).max(num_families * rw);
-            let dyn_cap = (bar_n * 2).max(num_families * rw * 4);
-            WRITE_QUEUE.drain_up_to(dyn_cap, &mut tasks);
+            WRITE_QUEUE.drain_up_to(max_cap, &mut tasks);
             if let Err((err, pending_addrs)) = self.commit_group(&mut tasks) {
                 eprintln!("write group error: {err}");
                 self.conn = None;
@@ -1565,6 +1719,10 @@ impl WriteWorker {
     }
 
     fn commit_group(&mut self, tasks: &mut Vec<WriteTask>) -> Result<(), (PgError, Vec<ReplyAddr>)> {
+        tasks.retain(|t| reactor::is_addr_alive(t.addr));
+        if tasks.is_empty() {
+            return Ok(());
+        }
         let all_addrs: Vec<ReplyAddr> = tasks.iter().map(|t| t.addr).collect();
         let conn = match Self::ensure_conn(&mut self.conn, self.cfg) {
             Ok(c) => c,
@@ -1808,7 +1966,7 @@ impl WriteWorker {
                             replies.push(OutgoingReply {
                                 addr: task.addr,
                                 status: 200,
-                                body,
+                                body: ReplyBody::Owned(body),
                             });
                         }
                         None => replies.push(reactor::error_reply(task.addr, 404, "profile not found")),
@@ -1892,7 +2050,7 @@ fn finalize_write_task(
                 replies.push(OutgoingReply {
                     addr,
                     status: 201,
-                    body,
+                    body: ReplyBody::Owned(body),
                 });
             }
             None => replies.push(reactor::error_reply(addr, 422, "duplicate username or email")),
@@ -1911,7 +2069,7 @@ fn finalize_write_task(
                 replies.push(OutgoingReply {
                     addr,
                     status: 200,
-                    body,
+                    body: ReplyBody::Owned(body),
                 });
             }
             None => replies.push(reactor::error_reply(addr, 401, "unauthorized")),
@@ -1931,7 +2089,7 @@ fn finalize_write_task(
                 replies.push(OutgoingReply {
                     addr,
                     status: 200,
-                    body,
+                    body: ReplyBody::Owned(body),
                 });
             }
             None => replies.push(reactor::error_reply(addr, 404, "profile not found")),
@@ -1975,7 +2133,7 @@ fn finalize_write_task(
             Some(_) => replies.push(OutgoingReply {
                 addr,
                 status: 204,
-                body: Vec::new(),
+                body: ReplyBody::Empty,
             }),
             None => replies.push(reactor::error_reply(addr, 404, "article not found")),
         },
@@ -2002,7 +2160,7 @@ fn finalize_write_task(
                 replies.push(OutgoingReply {
                     addr,
                     status: 201,
-                    body,
+                    body: ReplyBody::Owned(body),
                 });
             }
             None => replies.push(reactor::error_reply(addr, 404, "article not found")),
@@ -2012,7 +2170,7 @@ fn finalize_write_task(
             Some(_) => replies.push(OutgoingReply {
                 addr,
                 status: 204,
-                body: Vec::new(),
+                body: ReplyBody::Empty,
             }),
             None => replies.push(reactor::error_reply(addr, 404, "comment not found")),
         },
@@ -2037,6 +2195,10 @@ pub fn run_crypto_worker(cfg: &'static RuntimeConfig) {
             );
             BUSY_CRYPTO_WORKERS.fetch_add(1, Ordering::AcqRel);
         }
+        batch.retain(|t| match t {
+            CryptoTask::VerifyLogin { addr, .. } => reactor::is_addr_alive(*addr),
+            CryptoTask::HashPassword { write, .. } => reactor::is_addr_alive(write.addr),
+        });
         let t0 = Instant::now();
         non_std.clear();
         let mut i = 0;
@@ -2060,7 +2222,8 @@ pub fn run_crypto_worker(cfg: &'static RuntimeConfig) {
                 elapsed_us
             } else {
                 (prev * 3 + elapsed_us) / 4
-            };
+            }
+            .clamp(1_000, 150_000);
             EWMA_BCRYPT_US.store(next, Ordering::Relaxed);
         }
         let mut single: Vec<CryptoTask> = Vec::new();
@@ -2139,7 +2302,7 @@ fn execute_bcrypt_batch(tasks: &mut Vec<CryptoTask>, cfg: &RuntimeConfig, cost: 
                     replies.push(OutgoingReply {
                         addr,
                         status: 200,
-                        body,
+                        body: ReplyBody::Owned(body),
                     });
                 } else {
                     replies.push(reactor::error_reply(addr, 401, "invalid credentials"));
